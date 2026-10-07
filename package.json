@@ -1,0 +1,30 @@
+{
+  "name": "deepseek-harness-cdk",
+  "version": "0.1.0",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "test": "jest",
+    "cdk": "cdk",
+    "deploy": "tsx scripts/deploy.ts",
+    "show-config": "tsx scripts/show-config.ts"
+  },
+  "devDependencies": {
+    "@aws-sdk/client-cloudformation": "^3.1147.0",
+    "@aws-sdk/client-ec2": "^3.1147.0",
+    "@aws-sdk/client-sts": "^3.1147.0",
+    "@inquirer/prompts": "^8.7.3",
+    "@swc/core": "^1.15.0",
+    "@swc/jest": "^0.2.39",
+    "@types/jest": "^30",
+    "@types/node": "^24.10.1",
+    "aws-cdk": "2.1135.0",
+    "jest": "^30",
+    "tsx": "^4.23.0",
+    "typescript": "~7.0.2"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.263.0",
+    "constructs": "^10.5.0"
+  }
+}
