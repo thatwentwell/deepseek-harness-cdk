@@ -4,6 +4,9 @@
 #        DEEPSEEK_API_KEY=sk-... scripts/set-api-key.sh
 . "$(dirname "$0")/common.sh"
 
+[ "$(config_value llmProvider)" = "deepseek-api" ] || die "Este stack usa \"llmProvider\": \"$(config_value llmProvider)\"; la API key solo aplica con \"deepseek-api\".
+  Con Bedrock no hace falta: probá el modelo con scripts/test-model.sh."
+
 key="${DEEPSEEK_API_KEY:-}"
 if [ -z "$key" ]; then
   read -rsp "DeepSeek API key: " key

@@ -21,3 +21,11 @@ test('a missing file loads as undefined', () => {
 test('the real config file is not committed by default', () => {
   expect(fs.readFileSync(path.join(__dirname, '..', '.gitignore'), 'utf8')).toMatch(/^deploy\.config\.json$/m);
 });
+
+test('rejects an unknown provider or Bedrock model', () => {
+  const valid = loadDeployConfig(EXAMPLE_FILE)!;
+  expect(() => parseDeployConfig({ ...valid, llmProvider: 'openai' }, 'x.json')).toThrow(/"llmProvider" debe ser bedrock o deepseek-api/);
+  expect(() => parseDeployConfig({ ...valid, bedrockModel: 'deepseek.r1-v1:0' }, 'x.json')).toThrow(/"bedrockModel" debe ser uno de/);
+  // The model is irrelevant when the API is used.
+  expect(parseDeployConfig({ ...valid, llmProvider: 'deepseek-api', bedrockModel: 'x' }, 'x.json').llmProvider).toBe('deepseek-api');
+});

@@ -1,5 +1,8 @@
 {
   "region": "us-east-1",
+  "llmProvider": "bedrock",
+  "bedrockModel": "deepseek.v3.2",
+  "bedrockInferenceProfile": true,
   "stackName": "DeepseekHarness",
   "instanceType": "t4g.large",
   "volumeSizeGiB": 50,

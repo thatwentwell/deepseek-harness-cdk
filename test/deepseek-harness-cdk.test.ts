@@ -3,6 +3,9 @@ import { Match, Template } from 'aws-cdk-lib/assertions';
 import { DeepseekHarnessStack } from '../lib/deepseek-harness-stack';
 
 const baseProps = {
+  llmProvider: 'bedrock' as const,
+  bedrockModel: 'deepseek.v3.2',
+  bedrockInferenceProfile: true,
   instanceType: 't4g.large',
   dshVersion: '0.2.0-rc.2',
   nodeMajor: 22,
@@ -38,11 +41,62 @@ test('public mode creates no NAT gateway, private mode creates one', () => {
   synth({ privateSubnet: true }).resourceCountIs('AWS::EC2::NatGateway', 1);
 });
 
-test('creates the API key secret unless one is supplied', () => {
-  synth().resourceCountIs('AWS::SecretsManager::Secret', 1);
+test('deepseek-api creates the API key secret unless one is supplied', () => {
+  synth({ llmProvider: 'deepseek-api' }).resourceCountIs('AWS::SecretsManager::Secret', 1);
   synth({
+    llmProvider: 'deepseek-api',
     existingSecretArn: 'arn:aws:secretsmanager:us-east-1:111111111111:secret:dsh-AbCdEf',
   }).resourceCountIs('AWS::SecretsManager::Secret', 0);
+});
+
+test('bedrock creates no secret and no Bedrock resources leak into deepseek-api', () => {
+  synth().resourceCountIs('AWS::SecretsManager::Secret', 0);
+  const api = synth({ llmProvider: 'deepseek-api' });
+  api.resourceCountIs('AWS::Bedrock::ApplicationInferenceProfile', 0);
+  expect(JSON.stringify(api.toJSON())).not.toContain('bedrock:InvokeModel');
+});
+
+test('bedrock copies the model into a tagged application inference profile', () => {
+  synth().hasResourceProperties('AWS::Bedrock::ApplicationInferenceProfile', {
+    ModelSource: {
+      CopyFrom: { 'Fn::Join': ['', Match.arrayWith([Match.stringLikeRegexp('foundation-model/deepseek\\.v3\\.2$')])] },
+    },
+    Tags: Match.arrayWith([
+      { Key: 'app', Value: 'deepseek-harness' },
+      { Key: 'stack', Value: 'Test' },
+    ]),
+  });
+  synth({ bedrockInferenceProfile: false }).resourceCountIs('AWS::Bedrock::ApplicationInferenceProfile', 0);
+});
+
+test('the Bedrock role is assumable only by the instance role and can only invoke models', () => {
+  const template = synth();
+  template.hasResourceProperties('AWS::IAM::Role', {
+    Description: Match.stringLikeRegexp('Bedrock only'),
+    AssumeRolePolicyDocument: {
+      Statement: [Match.objectLike({ Principal: { AWS: { 'Fn::GetAtt': [Match.stringLikeRegexp('^HostRole'), 'Arn'] } } })],
+    },
+  });
+  template.hasResourceProperties('AWS::IAM::Policy', {
+    PolicyDocument: {
+      Statement: [
+        Match.objectLike({
+          Action: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'],
+          Resource: Match.arrayWith([{ 'Fn::GetAtt': [Match.stringLikeRegexp('^InferenceProfile'), 'InferenceProfileArn'] }]),
+        }),
+      ],
+    },
+  });
+});
+
+test('user data hands the model id and limits to the host', () => {
+  const userData = JSON.stringify(synth({ bedrockInferenceProfile: false }).toJSON());
+  expect(userData).toContain("export BEDROCK_MODEL_ID='deepseek.v3.2'");
+  expect(userData).toContain("export BEDROCK_MAX_TOKENS='8192'");
+});
+
+test('rejects Bedrock models the harness does not know', () => {
+  expect(() => synth({ bedrockModel: 'deepseek.r1-v1:0' })).toThrow(/Unsupported bedrockModel/);
 });
 
 test('resources carry the cost allocation tags and the disk inherits them', () => {
@@ -54,7 +108,7 @@ test('resources carry the cost allocation tags and the disk inherits them', () =
       { Key: 'stack', Value: 'Test' },
     ]),
   });
-  template.hasResourceProperties('AWS::SecretsManager::Secret', {
+  synth({ llmProvider: 'deepseek-api' }).hasResourceProperties('AWS::SecretsManager::Secret', {
     Tags: Match.arrayWith([{ Key: 'stack', Value: 'Test' }]),
   });
 });

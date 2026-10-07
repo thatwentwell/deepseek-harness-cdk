@@ -1,9 +1,26 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
+/** Where the agent's model runs. */
+export type LlmProvider = 'bedrock' | 'deepseek-api';
+export const LLM_PROVIDERS: readonly LlmProvider[] = ['bedrock', 'deepseek-api'];
+
+/**
+ * DeepSeek models on Bedrock that dsh's pi-ai catalog knows. Bedrock caps
+ * their output at 8K tokens, while the pi-ai catalog claims 80K, so the
+ * values here override the catalog (see assets/bootstrap.sh).
+ */
+export const BEDROCK_MODELS: Record<string, { name: string; contextWindow: number; maxTokens: number }> = {
+  'deepseek.v3.2': { name: 'DeepSeek V3.2', contextWindow: 163840, maxTokens: 8192 },
+  'deepseek.v3-v1:0': { name: 'DeepSeek-V3.1', contextWindow: 131072, maxTokens: 8192 },
+};
+
 /** Persisted deployment settings, written by `npm run deploy`. */
 export interface DeployConfig {
   region: string;
+  llmProvider: LlmProvider;
+  bedrockModel: string;
+  bedrockInferenceProfile: boolean;
   stackName: string;
   instanceType: string;
   volumeSizeGiB: number;
@@ -21,6 +38,9 @@ export const EXAMPLE_FILE = `${CONFIG_FILE}.example`;
 
 /** Values offered by the menu when there is no previous configuration. */
 export const DEFAULTS: Omit<DeployConfig, 'region'> = {
+  llmProvider: 'bedrock',
+  bedrockModel: 'deepseek.v3.2',
+  bedrockInferenceProfile: true,
   stackName: 'DeepseekHarness',
   instanceType: 't4g.large',
   volumeSizeGiB: 50,
@@ -34,6 +54,9 @@ export const DEFAULTS: Omit<DeployConfig, 'region'> = {
 /** One line per field, shown by `npm run show-config` and in the README. */
 export const FIELD_HELP: Record<keyof DeployConfig, string> = {
   region: 'Región de AWS donde se despliega el stack',
+  llmProvider: 'bedrock | deepseek-api: dónde corre el modelo',
+  bedrockModel: 'Modelo de DeepSeek en Bedrock (solo con bedrock)',
+  bedrockInferenceProfile: 'Perfil de inferencia con tags para costos (solo con bedrock)',
   stackName: 'Nombre del stack de CloudFormation',
   instanceType: 'Tipo de instancia EC2 (ARM o x86; la AMI se elige sola)',
   volumeSizeGiB: 'Tamaño del disco raíz en GiB',
@@ -43,11 +66,14 @@ export const FIELD_HELP: Record<keyof DeployConfig, string> = {
   webPort: 'Puerto de la Web UI (en loopback y en el túnel local)',
   blockImdsForAgent: 'Bloquea al agente el acceso a las credenciales de la instancia',
   vpcId: '(opcional) VPC existente en lugar de crear una',
-  existingSecretArn: '(opcional) Secreto existente con la DEEPSEEK_API_KEY',
+  existingSecretArn: '(opcional) Secreto existente con la DEEPSEEK_API_KEY (solo con deepseek-api)',
 };
 
 const REQUIRED_TYPES: Record<keyof DeployConfig, 'string' | 'number' | 'boolean'> = {
   region: 'string',
+  llmProvider: 'string',
+  bedrockModel: 'string',
+  bedrockInferenceProfile: 'boolean',
   stackName: 'string',
   instanceType: 'string',
   volumeSizeGiB: 'number',
@@ -78,6 +104,12 @@ export function parseDeployConfig(raw: unknown, source = CONFIG_FILE): DeployCon
   }
   for (const key of Object.keys(obj)) {
     if (!(key in REQUIRED_TYPES)) errors.push(`campo desconocido "${key}"`);
+  }
+  if (typeof obj.llmProvider === 'string' && !LLM_PROVIDERS.includes(obj.llmProvider as LlmProvider)) {
+    errors.push(`"llmProvider" debe ser ${LLM_PROVIDERS.join(' o ')}`);
+  }
+  if (obj.llmProvider === 'bedrock' && typeof obj.bedrockModel === 'string' && !(obj.bedrockModel in BEDROCK_MODELS)) {
+    errors.push(`"bedrockModel" debe ser uno de: ${Object.keys(BEDROCK_MODELS).join(', ')}`);
   }
   if (errors.length) {
     throw new Error(`${source} no es válido:\n  - ${errors.join('\n  - ')}`);

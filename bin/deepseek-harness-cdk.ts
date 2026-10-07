@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import * as cdk from 'aws-cdk-lib/core';
-import { CONFIG_FILE, DeployConfig, loadDeployConfig } from '../lib/deploy-config';
+import { CONFIG_FILE, DeployConfig, LlmProvider, loadDeployConfig } from '../lib/deploy-config';
 import { DeepseekHarnessStack } from '../lib/deepseek-harness-stack';
 
 const app = new cdk.App();
@@ -23,6 +23,9 @@ const bool = (key: keyof DeployConfig) => String(ctx(key) ?? saved[key]) === 'tr
 
 new DeepseekHarnessStack(app, str('stackName')!, {
   env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: str('region') },
+  llmProvider: str('llmProvider') as LlmProvider,
+  bedrockModel: str('bedrockModel')!,
+  bedrockInferenceProfile: bool('bedrockInferenceProfile'),
   instanceType: str('instanceType')!,
   dshVersion: str('dshVersion')!,
   nodeMajor: num('nodeMajor'),

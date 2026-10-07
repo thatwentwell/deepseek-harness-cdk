@@ -10,6 +10,7 @@
     "show-config": "tsx scripts/show-config.ts"
   },
   "devDependencies": {
+    "@aws-sdk/client-bedrock": "^3.1147.0",
     "@aws-sdk/client-cloudformation": "^3.1147.0",
     "@aws-sdk/client-ec2": "^3.1147.0",
     "@aws-sdk/client-sts": "^3.1147.0",

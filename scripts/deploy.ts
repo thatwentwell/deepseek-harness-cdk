@@ -1,9 +1,11 @@
 // Interactive deploy: `npm run deploy`.
-// Asks for region and instance type (plus optional advanced settings), checks
+// Asks for the model provider, region, model and instance type (plus
+// optional advanced settings), checks
 // the target account/region, writes deploy.config.json and runs `cdk deploy`.
 // The config file is only written after the summary is confirmed.
 import { spawnSync } from 'child_process';
 import { confirm, input, number, search, select } from '@inquirer/prompts';
+import { BedrockClient, ListFoundationModelsCommand } from '@aws-sdk/client-bedrock';
 import {
   CloudFormationClient,
   DescribeStacksCommand,
@@ -18,9 +20,11 @@ import {
 } from '@aws-sdk/client-ec2';
 import { GetCallerIdentityCommand, STSClient } from '@aws-sdk/client-sts';
 import {
+  BEDROCK_MODELS,
   CONFIG_FILE,
   DEFAULTS,
   DeployConfig,
+  LlmProvider,
   formatConfigRows,
   formatDeployConfig,
   loadDeployConfig,
@@ -73,14 +77,57 @@ async function main(): Promise<void> {
   const account = await getAccount(homeRegion ?? 'us-east-1');
   console.log(`Cuenta de AWS: ${account}\n`);
 
-  // --- Region ---------------------------------------------------------------
-  const regions = await listRegions(homeRegion ?? 'us-east-1');
-  const region = await select({
-    message: 'Región de destino',
-    choices: regions.map((r) => ({ value: r, name: REGION_NAMES[r] ? `${r}  (${REGION_NAMES[r]})` : r })),
-    default: previous?.region ?? homeRegion ?? 'us-east-1',
-    pageSize: 15,
+  // --- Model provider -------------------------------------------------------
+  let llmProvider = await select<LlmProvider>({
+    message: 'Proveedor del modelo',
+    choices: [
+      { value: 'bedrock', name: 'Amazon Bedrock (DeepSeek en tu cuenta de AWS, sin API key)' },
+      { value: 'deepseek-api', name: 'API de DeepSeek (requiere DEEPSEEK_API_KEY)' },
+    ],
+    default: previous?.llmProvider ?? DEFAULTS.llmProvider,
   });
+
+  // --- Region (and Bedrock model, which must exist in that region) ----------
+  const regions = await listRegions(homeRegion ?? 'us-east-1');
+  let region = previous?.region ?? homeRegion ?? 'us-east-1';
+  let bedrockModel = previous?.bedrockModel ?? DEFAULTS.bedrockModel;
+  for (;;) {
+    region = await select({
+      message: 'Región de destino',
+      choices: regions.map((r) => ({ value: r, name: REGION_NAMES[r] ? `${r}  (${REGION_NAMES[r]})` : r })),
+      default: region,
+      pageSize: 15,
+    });
+    if (llmProvider !== 'bedrock') break;
+
+    process.stdout.write('Consultando modelos DeepSeek en Bedrock... ');
+    const available = await listBedrockModels(region);
+    console.log(available.length ? `${available.length} disponibles.` : 'ninguno.');
+    if (available.length) {
+      bedrockModel = await select({
+        message: 'Modelo',
+        choices: available.map((id) => ({ value: id, name: `${BEDROCK_MODELS[id].name.padEnd(14)} ${id}` })),
+        default: available.includes(bedrockModel) ? bedrockModel : available[0],
+      });
+      break;
+    }
+    console.log(
+      `\n⚠ ${region} no ofrece ${Object.keys(BEDROCK_MODELS).join(' ni ')} on-demand en Bedrock.\n` +
+        '  La instancia y el modelo tienen que estar en la misma región (por ejemplo us-east-1,\n' +
+        '  us-east-2, us-west-2, sa-east-1, eu-west-2, eu-north-1 o ap-northeast-1).',
+    );
+    const next = await select({
+      message: '¿Qué hacemos?',
+      choices: [
+        { value: 'region', name: 'Elegir otra región' },
+        { value: 'api', name: 'Usar la API de DeepSeek en esta región' },
+      ],
+    });
+    if (next === 'api') {
+      llmProvider = 'deepseek-api';
+      break;
+    }
+  }
 
   // --- Instance type --------------------------------------------------------
   process.stdout.write('Consultando tipos de instancia disponibles... ');
@@ -113,7 +160,7 @@ async function main(): Promise<void> {
 
   // --- Advanced options -----------------------------------------------------
   const base: Omit<DeployConfig, 'region'> = { ...DEFAULTS, ...previous };
-  const config: DeployConfig = { ...base, region, instanceType };
+  const config: DeployConfig = { ...base, region, instanceType, llmProvider, bedrockModel };
 
   if (await confirm({ message: '¿Modificar opciones avanzadas (nombre del stack, disco, subred privada)?', default: false })) {
     config.stackName = await input({
@@ -149,6 +196,22 @@ async function main(): Promise<void> {
   if (existing && previous?.instanceType && previous.instanceType !== instanceType && previous.region === region) {
     console.log(`\n⚠ Cambiar ${previous.instanceType} → ${instanceType} detiene y reinicia la instancia (el disco se conserva).`);
   }
+  // The host is configured once, at creation: user data changes do not
+  // replace the instance (that would wipe the workspace).
+  const llmChanged =
+    previous &&
+    (previous.llmProvider !== config.llmProvider ||
+      (config.llmProvider === 'bedrock' &&
+        (previous.bedrockModel !== config.bedrockModel ||
+          previous.bedrockInferenceProfile !== config.bedrockInferenceProfile)));
+  if (existing && previous?.region === region && llmChanged) {
+    console.log(
+      '\n⚠ El proveedor o el modelo cambiaron, pero la instancia existente se configuró al crearse y no\n' +
+        '  se va a reconfigurar sola. Para aplicarlo hay que recrearla: "npx cdk destroy" y volver a\n' +
+        '  desplegar (se pierde el workspace; hacé un snapshot del disco antes).',
+    );
+    if (!(await confirm({ message: '¿Desplegar igualmente?', default: false }))) return cancel();
+  }
 
   const needsBootstrap = !(await findStack(cfn, 'CDKToolkit'));
   if (needsBootstrap) {
@@ -176,7 +239,10 @@ async function main(): Promise<void> {
   printOutputs(outputs);
   console.log(
     '\nPróximos pasos:\n' +
-      '  scripts/set-api-key.sh   guardar la DEEPSEEK_API_KEY y reiniciar el servicio\n' +
+      (config.llmProvider === 'deepseek-api'
+        ? '  scripts/set-api-key.sh   guardar la DEEPSEEK_API_KEY y reiniciar el servicio\n'
+        : '') +
+      '  scripts/test-model.sh    probar el modelo desde la instancia\n' +
       '  scripts/connect.sh       abrir el túnel y obtener la URL de la Web UI\n' +
       '  npm run show-config      volver a ver esta configuración',
   );
@@ -194,6 +260,26 @@ async function getAccount(region: string): Promise<string> {
 async function listRegions(region: string): Promise<string[]> {
   const res = await new EC2Client({ region }).send(new DescribeRegionsCommand({}));
   return (res.Regions ?? []).map((r) => r.RegionName!).sort();
+}
+
+/** Supported DeepSeek models that Bedrock serves on demand in the region. */
+async function listBedrockModels(region: string): Promise<string[]> {
+  try {
+    const res = await new BedrockClient({ region }).send(new ListFoundationModelsCommand({ byProvider: 'DeepSeek' }));
+    const ids = new Set(
+      (res.modelSummaries ?? [])
+        .filter((m) => m.inferenceTypesSupported?.includes('ON_DEMAND'))
+        .map((m) => m.modelId!),
+    );
+    return Object.keys(BEDROCK_MODELS).filter((id) => ids.has(id));
+  } catch (e) {
+    // Missing permissions must not look like "no models here".
+    if ((e as Error).name === 'AccessDeniedException') {
+      throw new Error(`Sin permiso para listar modelos de Bedrock (bedrock:ListFoundationModels): ${(e as Error).message}`);
+    }
+    // Bedrock is not offered at all in some regions.
+    return [];
+  }
 }
 
 async function listOfferedTypes(ec2: EC2Client): Promise<Set<string>> {

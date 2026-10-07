@@ -17,12 +17,15 @@ Todos los recursos del stack llevan dos tags:
 
 El disco EBS hereda los tags de la instancia al crearse.
 
+**Con `llmProvider: bedrock`, el consumo del modelo también entra.** Las llamadas pasan por un *application inference profile* que lleva los mismos tags, así que los tokens de DeepSeek en Bedrock se facturan bajo `app` y `stack`. Esto requiere `bedrockInferenceProfile: true` (el valor por defecto).
+
 **Quedan fuera del filtro por tag:**
 
 - **El cargo por la IPv4 pública** (~3,60 USD/mes), que AWS no permite etiquetar.
 - **Parte de la transferencia de datos.**
 - **Los recursos del bootstrap de CDK** (bucket S3, repositorio ECR, roles).
-- **El consumo de la API de DeepSeek.** No es un costo de AWS; se controla desde la consola de DeepSeek.
+- **Con `llmProvider: deepseek-api`, el consumo del modelo.** No es un costo de AWS; se controla desde la consola de DeepSeek.
+- **Con `bedrockInferenceProfile: false`, el consumo de Bedrock.** Aparece en la factura de AWS, pero sin tags.
 
 **Tampoco es un tope en tiempo real.** AWS actualiza los datos de Budgets hasta 3 veces por día, así que una alerta puede llegar entre 8 y 24 h después de superarse el umbral.
 
@@ -33,10 +36,14 @@ El disco EBS hereda los tags de la instancia al crearse.
 | `t4g.large` encendida 24/7 | ~49 |
 | Disco gp3 de 50 GB | ~4 |
 | IPv4 pública | ~3,6 |
-| Secreto de Secrets Manager | 0,40 |
+| Secreto de Secrets Manager (solo `deepseek-api`) | 0,40 |
 | NAT Gateway (solo con `privateSubnet: true`) | ~33 + tráfico |
 
-Un límite razonable es **70 USD** sin subred privada y **110 USD** con subred privada. Ajustalo si cambiaste el tipo de instancia o la región.
+La infraestructura suma unos **57 USD/mes** sin subred privada y unos **90 USD/mes** con subred privada.
+
+**Con Bedrock hay que sumar los tokens**, que dependen del uso. Como referencia, el catálogo de dsh lista DeepSeek V3.2 a ~0,62 USD por millón de tokens de entrada y ~1,85 USD por millón de salida (verificá los valores actuales en la [página de precios de Bedrock](https://aws.amazon.com/bedrock/pricing/)). Un agente de código reenvía el contexto en cada paso, así que la entrada domina: por ejemplo, 5 millones de tokens de entrada y 300.000 de salida por día son unos 3,70 USD/día: unos 80 USD/mes en 22 días hábiles, o unos 110 USD si se usa todos los días.
+
+Un punto de partida razonable es **70 USD** con la API de DeepSeek (solo infraestructura) y **150 USD** con Bedrock. Ajustalo después del primer mes con el gasto real.
 
 ### Permisos
 
