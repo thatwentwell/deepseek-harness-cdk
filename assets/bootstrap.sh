@@ -8,6 +8,8 @@ exec > >(tee -a /var/log/dsh-bootstrap.log) 2>&1
 # cfn-signal (used by the exit trap) and the toolchain the agent and native
 # npm modules need.
 dnf install -y aws-cfn-bootstrap git tar xz gcc-c++ make python3 iptables-nft jq
+# The IMDS block below depends on it: fail the deploy now, not at service start.
+command -v iptables >/dev/null || command -v iptables-nft >/dev/null || { echo "iptables not installed"; exit 1; }
 
 # --- Node.js (official tarball, checksum-verified) -------------------------
 case "$(uname -m)" in
@@ -143,12 +145,15 @@ fi
 cat > /usr/local/sbin/dsh-web-prestart <<'EOF'
 #!/bin/bash
 set -euo pipefail
+# The unit's PATH is the agent's, without the sbin directories root tools live in.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 . /etc/dsh-web.conf
 
 if [ "$BLOCK_IMDS" = "true" ]; then
+  ipt=$(command -v iptables || command -v iptables-nft)
   uid=$(id -u dsh)
-  iptables -C OUTPUT -d 169.254.169.254 -m owner --uid-owner "$uid" -j REJECT 2>/dev/null \
-    || iptables -I OUTPUT -d 169.254.169.254 -m owner --uid-owner "$uid" -j REJECT
+  "$ipt" -C OUTPUT -d 169.254.169.254 -m owner --uid-owner "$uid" -j REJECT 2>/dev/null \
+    || "$ipt" -I OUTPUT -d 169.254.169.254 -m owner --uid-owner "$uid" -j REJECT
 fi
 
 umask 077

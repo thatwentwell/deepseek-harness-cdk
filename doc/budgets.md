@@ -37,7 +37,7 @@ El disco EBS hereda los tags de la instancia al crearse.
 | Disco gp3 de 50 GB | ~4 |
 | IPv4 pública | ~3,6 |
 | Secreto de Secrets Manager (solo `deepseek-api`) | 0,40 |
-| NAT Gateway (solo con `privateSubnet: true`) | ~33 + tráfico |
+| NAT Gateway (solo con una VPC nueva y `privateSubnet: true`) | ~33 + tráfico |
 
 La infraestructura suma unos **57 USD/mes** sin subred privada y unos **90 USD/mes** con subred privada.
 
@@ -66,7 +66,7 @@ Para comprobar que los recursos tienen los tags:
 aws resourcegroupstaggingapi get-resources --region "$REGION" --tag-filters Key=stack,Values="$STACK" --query 'ResourceTagMappingList[].ResourceARN' --output table
 ```
 
-Deberías ver la instancia, el volumen, el secreto, la VPC, las subredes y el security group.
+Deberías ver la instancia, el volumen, el security group y, según la configuración, el perfil de inferencia o el secreto. Con una VPC nueva también aparecen la VPC y sus subredes; con una VPC existente, no (son de otro dueño y no llevan estos tags).
 
 ## Paso 1: activar los tags de asignación de costos
 

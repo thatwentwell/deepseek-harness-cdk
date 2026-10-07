@@ -42,11 +42,13 @@ Con `llmProvider: deepseek-api`, antes de conectarte cargá la clave con `script
 `npm run deploy` hace lo siguiente:
 
 1. Valida las credenciales de AWS y muestra la cuenta de destino.
-2. Pide el proveedor del modelo (Bedrock o API de DeepSeek) y la región (solo las habilitadas en la cuenta). Con Bedrock, consulta qué modelos DeepSeek ofrece esa región y te deja elegir; si no hay ninguno, te propone otra región o usar la API.
-3. Pide el tipo de instancia (solo los disponibles en esa región, con vCPU, memoria y arquitectura). Opcionalmente, nombre del stack, disco y subred privada.
-4. Verifica el destino. Ofrece hacer el `cdk bootstrap` si la región no lo tiene, avisa si ya hay un stack desplegado en otra región y avisa si cambiar el tipo de instancia la va a reiniciar.
-5. Muestra un resumen y, recién al confirmar, escribe `deploy.config.json` y ejecuta `cdk deploy`. Si cancelás antes, no se guarda nada.
-6. Al terminar, muestra la configuración, los outputs del stack y los próximos pasos.
+2. Pide el **nombre del stack**, que identifica el entorno: con otro nombre se despliega un entorno aparte.
+3. Pide el proveedor del modelo (Bedrock o API de DeepSeek) y la región (solo las habilitadas en la cuenta). Con Bedrock, consulta qué modelos DeepSeek ofrece esa región y te deja elegir; si no hay ninguno, te propone otra región o usar la API.
+4. Pide la **red**: crear una VPC nueva (pública, o privada con NAT) o usar una VPC existente. Para crear una, compara antes el uso de VPCs, internet gateways e IPs elásticas contra las cuotas de la cuenta, y si no hay cupo la opción aparece deshabilitada. Para usar una existente, lista sus subredes clasificadas por sus rutas (pública si salen por un internet gateway, privada si salen por un NAT) y descarta las que no tienen salida a internet.
+5. Pide el tipo de instancia (solo los disponibles en esa región, o en la zona de la subred elegida, con vCPU, memoria y arquitectura). Opcionalmente, el tamaño del disco.
+6. Verifica el destino. Ofrece hacer el `cdk bootstrap` si la región no lo tiene. Avisa si el entorno guardado sigue desplegado y vas a crear otro (otra región u otro nombre), si el nombre elegido ya pertenece a otro stack de la región, y si un cambio va a reiniciar o reemplazar la instancia.
+7. Muestra un resumen y, recién al confirmar, escribe `deploy.config.json` y ejecuta `cdk deploy`. Si cancelás antes, no se guarda nada.
+8. Al terminar, muestra la configuración, los outputs del stack y los próximos pasos.
 
 Abrí la URL que imprime `connect.sh` (`http://127.0.0.1:3080/...`) mientras el túnel esté abierto.
 
@@ -73,15 +75,29 @@ npm run show-config
 | `stackName` | `DeepseekHarness` | Nombre del stack |
 | `instanceType` | `t4g.large` | Graviton o x86; la AMI se elige según la arquitectura |
 | `volumeSizeGiB` | `50` | Disco raíz (workspace y `~/.dsh`) |
-| `privateSubnet` | `false` | `true`: subred privada + NAT Gateway (~32 USD/mes extra) |
+| `network` | `{"mode": "new", "privateSubnet": false}` | Red del entorno; ver abajo |
 | `dshVersion` | `0.2.0-rc.2` | Versión de `@deepseek-ai/dsh` |
 | `nodeMajor` | `22` | Versión mayor de Node.js |
 | `webPort` | `3080` | Puerto de la UI (en loopback y en el túnel local) |
 | `blockImdsForAgent` | `true` | `false` si querés que el agente use el rol de la instancia |
-| `vpcId` | `""` | (opcional) VPC existente |
 | `existingSecretArn` | `""` | (opcional, solo `deepseek-api`) Secreto existente con la API key |
 
-Después de editar el archivo a mano, volvé a ejecutar `npm run deploy` (el menú propone los valores guardados) o `npx cdk deploy` (sin menú). Un `-c clave=valor` en la línea de comandos tiene prioridad sobre el archivo, por ejemplo `npx cdk deploy -c instanceType=m7g.xlarge`. Todos los comandos de `cdk` (`synth`, `diff`, `destroy`) y los scripts `set-api-key.sh`, `test-model.sh` y `connect.sh` usan la región y el stack de este archivo, y fallan con un mensaje claro si no existe o le faltan parámetros.
+`network` tiene dos formas:
+
+```json
+{ "mode": "new", "privateSubnet": false }
+```
+
+```json
+{ "mode": "existing", "vpcId": "vpc-…", "subnetId": "subnet-…", "availabilityZone": "us-east-1a", "subnetType": "public" }
+```
+
+- **`new`:** el stack crea su propia VPC. Con `privateSubnet: true` la instancia va en una subred privada con NAT Gateway (~32 USD/mes extra). Consume una VPC y un internet gateway de la cuota de la región (5 de cada uno por defecto).
+- **`existing`:** la instancia va en una subred que ya existe y el stack no crea red. `subnetType` es `public` si la subred sale a internet por un internet gateway (la instancia recibe IP pública) o `private` si sale por un NAT. Una subred sin salida a internet no sirve, porque la instancia descarga Node.js y dsh al crearse. La VPC se importa con estos datos, sin consultar AWS al sintetizar, así que tienen que ser correctos: el menú los completa solo.
+
+Cambiar la red de un stack ya desplegado reemplaza la instancia (se pierde el workspace); el menú lo avisa.
+
+Después de editar el archivo a mano, volvé a ejecutar `npm run deploy` (el menú propone los valores guardados) o `npx cdk deploy` (sin menú). Un `-c clave=valor` en la línea de comandos tiene prioridad sobre el archivo, por ejemplo `npx cdk deploy -c instanceType=m7g.xlarge`. Para `network` se pasa el objeto entero en JSON: `-c network='{"mode":"new","privateSubnet":true}'`. Todos los comandos de `cdk` (`synth`, `diff`, `destroy`) y los scripts `set-api-key.sh`, `test-model.sh` y `connect.sh` usan la región y el stack de este archivo, y fallan con un mensaje claro si no existe o le faltan parámetros.
 
 ## Operación
 

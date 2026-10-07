@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import * as cdk from 'aws-cdk-lib/core';
-import { CONFIG_FILE, DeployConfig, LlmProvider, loadDeployConfig } from '../lib/deploy-config';
+import { CONFIG_FILE, DeployConfig, LlmProvider, loadDeployConfig, parseDeployConfig } from '../lib/deploy-config';
 import { DeepseekHarnessStack } from '../lib/deepseek-harness-stack';
 
 const app = new cdk.App();
@@ -31,8 +31,8 @@ new DeepseekHarnessStack(app, str('stackName')!, {
   nodeMajor: num('nodeMajor'),
   webPort: num('webPort'),
   volumeSizeGiB: num('volumeSizeGiB'),
-  privateSubnet: bool('privateSubnet'),
-  vpcId: str('vpcId') || undefined,
+  // `-c network='{"mode":"new","privateSubnet":true}'` overrides the whole object.
+  network: ctx('network') ? parseDeployConfig({ ...saved, network: JSON.parse(ctx('network')!) }, '-c network').network : saved.network,
   existingSecretArn: str('existingSecretArn') || undefined,
   blockImdsForAgent: bool('blockImdsForAgent'),
 });

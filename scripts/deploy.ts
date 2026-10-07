@@ -20,11 +20,21 @@ import {
 } from '@aws-sdk/client-ec2';
 import { GetCallerIdentityCommand, STSClient } from '@aws-sdk/client-sts';
 import {
+  VpcInfo,
+  checkNewVpcQuotas,
+  discoverVpcs,
+  formatQuotas,
+  quotaFits,
+  quotaIncreaseHints,
+} from './aws-network';
+import {
   BEDROCK_MODELS,
   CONFIG_FILE,
   DEFAULTS,
   DeployConfig,
   LlmProvider,
+  NetworkConfig,
+  describeNetwork,
   formatConfigRows,
   formatDeployConfig,
   loadDeployConfig,
@@ -76,6 +86,14 @@ async function main(): Promise<void> {
   const homeRegion = await new EC2Client({}).config.region().catch(() => undefined);
   const account = await getAccount(homeRegion ?? 'us-east-1');
   console.log(`Cuenta de AWS: ${account}\n`);
+
+  // --- Stack name -------------------------------------------------------------
+  // It identifies the environment: a new name deploys a separate one.
+  const stackName = await input({
+    message: 'Nombre del stack (identifica el entorno)',
+    default: previous?.stackName ?? DEFAULTS.stackName,
+    validate: (v) => /^[A-Za-z][A-Za-z0-9-]{0,127}$/.test(v) || 'Letras, números y guiones; debe empezar con letra',
+  });
 
   // --- Model provider -------------------------------------------------------
   let llmProvider = await select<LlmProvider>({
@@ -129,11 +147,20 @@ async function main(): Promise<void> {
     }
   }
 
-  // --- Instance type --------------------------------------------------------
-  process.stdout.write('Consultando tipos de instancia disponibles... ');
+  // --- Network --------------------------------------------------------------
   const ec2 = new EC2Client({ region });
-  const offered = await listOfferedTypes(ec2);
-  console.log(`${offered.size} disponibles en ${region}.`);
+  // The saved settings describe this environment only if region and name match.
+  const sameEnv = previous?.region === region && previous.stackName === stackName;
+  const stackExisted = sameEnv && !!(await findStack(new CloudFormationClient({ region }), stackName));
+  const network = await chooseNetwork(ec2, region, sameEnv ? previous.network : undefined, stackExisted);
+  if (!network) return cancel('No hay red disponible para desplegar.');
+
+  // --- Instance type --------------------------------------------------------
+  // An existing subnet pins the availability zone, and not every type is in every zone.
+  const az = network.mode === 'existing' ? network.availabilityZone : undefined;
+  process.stdout.write('Consultando tipos de instancia disponibles... ');
+  const offered = await listOfferedTypes(ec2, az);
+  console.log(`${offered.size} disponibles en ${az ?? region}.`);
 
   const currentType = previous?.instanceType ?? DEFAULTS.instanceType;
   const shortlist = [...new Set([currentType, ...RECOMMENDED_TYPES])].filter((t) => offered.has(t));
@@ -160,21 +187,12 @@ async function main(): Promise<void> {
 
   // --- Advanced options -----------------------------------------------------
   const base: Omit<DeployConfig, 'region'> = { ...DEFAULTS, ...previous };
-  const config: DeployConfig = { ...base, region, instanceType, llmProvider, bedrockModel };
+  const config: DeployConfig = { ...base, region, stackName, instanceType, llmProvider, bedrockModel, network };
 
-  if (await confirm({ message: '¿Modificar opciones avanzadas (nombre del stack, disco, subred privada)?', default: false })) {
-    config.stackName = await input({
-      message: 'Nombre del stack',
-      default: base.stackName,
-      validate: (v) => /^[A-Za-z][A-Za-z0-9-]{0,127}$/.test(v) || 'Letras, números y guiones; debe empezar con letra',
-    });
+  if (await confirm({ message: `¿Modificar opciones avanzadas (disco: ${base.volumeSizeGiB} GiB)?`, default: false })) {
     config.volumeSizeGiB =
       (await number({ message: 'Tamaño del disco (GiB)', default: base.volumeSizeGiB, min: 20, max: 16384, required: true })) ??
       base.volumeSizeGiB;
-    config.privateSubnet = await confirm({
-      message: '¿Subred privada con NAT Gateway? (~32 USD/mes extra)',
-      default: base.privateSubnet,
-    });
   }
 
   // --- Preflight ------------------------------------------------------------
@@ -182,18 +200,42 @@ async function main(): Promise<void> {
   const cfn = new CloudFormationClient({ region });
   const existing = await findStack(cfn, config.stackName);
 
-  if (previous && previous.region !== region) {
+  if (previous && !sameEnv) {
     const oldStack = await findStack(new CloudFormationClient({ region: previous.region }), previous.stackName);
     if (oldStack) {
       console.log(
-        `\n⚠ El stack "${previous.stackName}" ya existe en ${previous.region}. Desplegar en ${region} crea un\n` +
-          '  entorno nuevo; el anterior sigue corriendo (y generando costos) hasta que lo borres.\n' +
-          '  Los scripts set-api-key/connect pasarán a apuntar al nuevo.',
+        `\n⚠ El stack "${previous.stackName}" sigue desplegado en ${previous.region}. Desplegar "${stackName}" en\n` +
+          `  ${region} crea un entorno nuevo; el anterior sigue corriendo (y generando costos) hasta que lo borres.\n` +
+          '  Los scripts del proyecto (connect, test-model, set-api-key) pasarán a apuntar al nuevo.',
       );
       if (!(await confirm({ message: '¿Continuar igualmente?', default: false }))) return cancel();
     }
   }
-  if (existing && previous?.instanceType && previous.instanceType !== instanceType && previous.region === region) {
+  if (existing && !sameEnv) {
+    console.log(
+      `\n⚠ Ya existe un stack "${stackName}" en ${region} que no corresponde a la configuración guardada.\n` +
+        '  Desplegar lo va a modificar con esta configuración (puede reemplazar su instancia y su red).',
+    );
+    if (!(await confirm({ message: '¿Actualizar ese stack?', default: false }))) return cancel();
+  }
+  // Quotas only matter when this deploy creates the VPC; re-checked here
+  // because usage may have changed while the menu was open.
+  if (network.mode === 'new' && !existing) {
+    const quotas = await checkNewVpcQuotas(region, network.privateSubnet);
+    console.log(`\nCuotas para una VPC nueva en ${region}:\n${formatQuotas(quotas)}`);
+    if (!quotas.every(quotaFits)) {
+      return cancel(`No hay cupo para crear la VPC. Elegí una VPC existente, o pedí más cupo:\n${quotaIncreaseHints(quotas, region)}\n`);
+    }
+  }
+  const networkChanged = previous && JSON.stringify(previous.network) !== JSON.stringify(network);
+  if (existing && sameEnv && networkChanged) {
+    console.log(
+      `\n⚠ La red cambia (${describeNetwork(previous.network)} → ${describeNetwork(network)}).\n` +
+        '  CloudFormation va a reemplazar la instancia: se pierde el workspace (hacé un snapshot del disco antes).',
+    );
+    if (!(await confirm({ message: '¿Desplegar igualmente?', default: false }))) return cancel();
+  }
+  if (existing && previous?.instanceType && previous.instanceType !== instanceType && sameEnv) {
     console.log(`\n⚠ Cambiar ${previous.instanceType} → ${instanceType} detiene y reinicia la instancia (el disco se conserva).`);
   }
   // The host is configured once, at creation: user data changes do not
@@ -204,7 +246,7 @@ async function main(): Promise<void> {
       (config.llmProvider === 'bedrock' &&
         (previous.bedrockModel !== config.bedrockModel ||
           previous.bedrockInferenceProfile !== config.bedrockInferenceProfile)));
-  if (existing && previous?.region === region && llmChanged) {
+  if (existing && sameEnv && llmChanged) {
     console.log(
       '\n⚠ El proveedor o el modelo cambiaron, pero la instancia existente se configuró al crearse y no\n' +
         '  se va a reconfigurar sola. Para aplicarlo hay que recrearla: "npx cdk destroy" y volver a\n' +
@@ -282,9 +324,105 @@ async function listBedrockModels(region: string): Promise<string[]> {
   }
 }
 
-async function listOfferedTypes(ec2: EC2Client): Promise<Set<string>> {
+/**
+ * Asks where to deploy: a new VPC (only offered when the quotas allow it) or
+ * an existing VPC and one of its subnets with internet egress. Returns
+ * undefined when no option is usable.
+ */
+async function chooseNetwork(
+  ec2: EC2Client,
+  region: string,
+  previous: NetworkConfig | undefined,
+  stackExisted: boolean,
+): Promise<NetworkConfig | undefined> {
+  process.stdout.write('Consultando VPCs y cuotas... ');
+  const vpcs = await discoverVpcs(ec2);
+  // An already deployed stack reuses the VPC it created: nothing new to fit.
+  const reusesOwnVpc = stackExisted && previous?.mode === 'new';
+  const quotas = {
+    public: reusesOwnVpc ? [] : await checkNewVpcQuotas(region, false),
+    private: reusesOwnVpc ? [] : await checkNewVpcQuotas(region, true),
+  };
+  console.log(`${vpcs.length} VPCs en ${region}.`);
+
+  const usable = (v: VpcInfo) => v.subnets.filter((s) => s.kind !== 'isolated');
+  const canCreate = quotas.public.every(quotaFits);
+  const vpcChoices = vpcs.map((v) => {
+    const pub = v.subnets.filter((s) => s.kind === 'public').length;
+    const priv = v.subnets.filter((s) => s.kind === 'private').length;
+    const label = [v.vpcId, v.name && `"${v.name}"`, v.isDefault && '(default)', v.cidr].filter(Boolean).join(' ');
+    return {
+      value: v.vpcId,
+      name: `${label} · ${pub} públicas, ${priv} privadas`,
+      disabled: usable(v).length ? false : 'sin subredes con salida a internet',
+    };
+  });
+
+  if (!canCreate) console.log(`\nNo hay cupo para una VPC nueva:\n${formatQuotas(quotas.public)}\n`);
+  if (!canCreate && !vpcChoices.some((c) => !c.disabled)) {
+    console.log(
+      'Tampoco hay VPCs existentes con salida a internet. Pedí más cupo o usá otra región:\n' +
+        quotaIncreaseHints(quotas.public, region),
+    );
+    return undefined;
+  }
+
+  const enabled = new Set([...(canCreate ? ['new'] : []), ...vpcChoices.filter((c) => !c.disabled).map((c) => c.value)]);
+  const defaultVpc = vpcs.find((v) => v.isDefault && usable(v).length)?.vpcId;
+  const preferred = previous?.mode === 'existing' ? previous.vpcId : previous?.mode === 'new' ? 'new' : canCreate ? 'new' : defaultVpc;
+  const choice = await select({
+    message: 'Red',
+    choices: [
+      {
+        value: 'new',
+        name: 'Crear una VPC nueva para este entorno',
+        disabled: canCreate ? false : 'sin cupo de VPCs o internet gateways',
+      },
+      ...vpcChoices,
+    ],
+    default: preferred && enabled.has(preferred) ? preferred : [...enabled][0],
+    pageSize: 12,
+  });
+
+  if (choice === 'new') {
+    for (;;) {
+      const privateSubnet = await confirm({
+        message: '¿Subred privada con NAT Gateway? (~32 USD/mes extra)',
+        default: previous?.mode === 'new' ? previous.privateSubnet : false,
+      });
+      if (!privateSubnet || quotas.private.every(quotaFits)) return { mode: 'new', privateSubnet };
+      console.log(`\nNo hay cupo para el NAT Gateway:\n${formatQuotas(quotas.private)}\n`);
+    }
+  }
+
+  const vpc = vpcs.find((v) => v.vpcId === choice)!;
+  const subnets = usable(vpc);
+  const subnetId = await select({
+    message: 'Subred',
+    choices: subnets.map((s) => ({
+      value: s.subnetId,
+      name: [s.subnetId, s.availabilityZone, s.kind === 'public' ? 'pública' : 'privada', s.cidr, s.name && `"${s.name}"`]
+        .filter(Boolean)
+        .join('  '),
+    })),
+    default: previous?.mode === 'existing' && subnets.some((s) => s.subnetId === previous.subnetId) ? previous.subnetId : undefined,
+  });
+  const subnet = subnets.find((s) => s.subnetId === subnetId)!;
+  return {
+    mode: 'existing',
+    vpcId: vpc.vpcId,
+    subnetId,
+    availabilityZone: subnet.availabilityZone,
+    subnetType: subnet.kind as 'public' | 'private',
+  };
+}
+
+async function listOfferedTypes(ec2: EC2Client, availabilityZone?: string): Promise<Set<string>> {
   const types = new Set<string>();
-  for await (const page of paginateDescribeInstanceTypeOfferings({ client: ec2 }, { LocationType: 'region' })) {
+  const query = availabilityZone
+    ? { LocationType: 'availability-zone' as const, Filters: [{ Name: 'location', Values: [availabilityZone] }] }
+    : { LocationType: 'region' as const };
+  for await (const page of paginateDescribeInstanceTypeOfferings({ client: ec2 }, query)) {
     for (const o of page.InstanceTypeOfferings ?? []) types.add(o.InstanceType!);
   }
   return types;
@@ -308,7 +446,10 @@ async function findStack(cfn: CloudFormationClient, stackName: string) {
   try {
     const res = await cfn.send(new DescribeStacksCommand({ StackName: stackName }));
     const stack = res.Stacks?.[0];
-    return stack && stack.StackStatus !== 'DELETE_COMPLETE' ? stack : undefined;
+    // A stack whose creation failed and rolled back holds no resources, and
+    // `cdk deploy` deletes it before creating it again: treat it as absent.
+    const gone = ['DELETE_COMPLETE', 'ROLLBACK_COMPLETE'];
+    return stack && !gone.includes(stack.StackStatus!) ? stack : undefined;
   } catch (e) {
     if ((e as Error).message?.includes('does not exist')) return undefined;
     throw e;

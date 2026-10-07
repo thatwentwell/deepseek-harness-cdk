@@ -7,6 +7,7 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { Construct } from 'constructs';
 import { BEDROCK_MODELS, LlmProvider } from './deploy-config';
+import { HarnessNetwork, NetworkConfig } from './network';
 
 export interface DeepseekHarnessStackProps extends cdk.StackProps {
   /** `bedrock`: DeepSeek on Amazon Bedrock; `deepseek-api`: DeepSeek's own API. */
@@ -28,10 +29,8 @@ export interface DeepseekHarnessStackProps extends cdk.StackProps {
   readonly webPort: number;
   /** Root EBS volume size in GiB (holds the workspace and ~/.dsh). */
   readonly volumeSizeGiB: number;
-  /** Put the instance in a private subnet behind a NAT gateway (extra cost). */
-  readonly privateSubnet: boolean;
-  /** Import this VPC instead of creating one (requires an explicit env). */
-  readonly vpcId?: string;
+  /** A VPC to create, or an existing VPC and subnet to deploy into. */
+  readonly network: NetworkConfig;
   /** Use an existing secret that holds DEEPSEEK_API_KEY (deepseek-api only). */
   readonly existingSecretArn?: string;
   /**
@@ -45,18 +44,8 @@ export class DeepseekHarnessStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: DeepseekHarnessStackProps) {
     super(scope, id, props);
 
-    const vpc = props.vpcId
-      ? ec2.Vpc.fromLookup(this, 'Vpc', { vpcId: props.vpcId })
-      : new ec2.Vpc(this, 'Vpc', {
-          maxAzs: 2,
-          natGateways: props.privateSubnet ? 1 : 0,
-          subnetConfiguration: [
-            { name: 'public', subnetType: ec2.SubnetType.PUBLIC, cidrMask: 24 },
-            ...(props.privateSubnet
-              ? [{ name: 'private', subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS, cidrMask: 24 }]
-              : []),
-          ],
-        });
+    const network = new HarnessNetwork(this, 'Network', props.network);
+    const vpc = network.vpc;
 
     const useBedrock = props.llmProvider === 'bedrock';
     const model = BEDROCK_MODELS[props.bedrockModel];
@@ -146,10 +135,8 @@ export class DeepseekHarnessStack extends cdk.Stack {
 
     const instance = new ec2.Instance(this, 'Host', {
       vpc,
-      vpcSubnets: {
-        subnetType: props.privateSubnet ? ec2.SubnetType.PRIVATE_WITH_EGRESS : ec2.SubnetType.PUBLIC,
-      },
-      associatePublicIpAddress: props.privateSubnet ? undefined : true,
+      vpcSubnets: network.subnets,
+      associatePublicIpAddress: network.publicIp ? true : undefined,
       instanceType,
       machineImage: ec2.MachineImage.latestAmazonLinux2023({ cpuType }),
       securityGroup,

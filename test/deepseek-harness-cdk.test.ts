@@ -11,7 +11,7 @@ const baseProps = {
   nodeMajor: 22,
   webPort: 3080,
   volumeSizeGiB: 50,
-  privateSubnet: false,
+  network: { mode: 'new' as const, privateSubnet: false },
   blockImdsForAgent: true,
 };
 
@@ -38,7 +38,7 @@ test('instance requires IMDSv2 and has an encrypted gp3 root volume', () => {
 
 test('public mode creates no NAT gateway, private mode creates one', () => {
   synth().resourceCountIs('AWS::EC2::NatGateway', 0);
-  synth({ privateSubnet: true }).resourceCountIs('AWS::EC2::NatGateway', 1);
+  synth({ network: { mode: 'new', privateSubnet: true } }).resourceCountIs('AWS::EC2::NatGateway', 1);
 });
 
 test('deepseek-api creates the API key secret unless one is supplied', () => {
@@ -110,5 +110,34 @@ test('resources carry the cost allocation tags and the disk inherits them', () =
   });
   synth({ llmProvider: 'deepseek-api' }).hasResourceProperties('AWS::SecretsManager::Secret', {
     Tags: Match.arrayWith([{ Key: 'stack', Value: 'Test' }]),
+  });
+});
+
+const existingNetwork = (subnetType: 'public' | 'private') => ({
+  network: {
+    mode: 'existing' as const,
+    vpcId: 'vpc-0abc1234',
+    subnetId: 'subnet-0def5678',
+    availabilityZone: 'us-east-1b',
+    subnetType,
+  },
+});
+
+test('an existing VPC creates no network resources and places the host in the chosen subnet', () => {
+  const template = synth(existingNetwork('public'));
+  for (const type of ['AWS::EC2::VPC', 'AWS::EC2::InternetGateway', 'AWS::EC2::Subnet', 'AWS::EC2::NatGateway']) {
+    template.resourceCountIs(type, 0);
+  }
+  template.hasResourceProperties('AWS::EC2::Instance', {
+    AvailabilityZone: 'us-east-1b',
+    NetworkInterfaces: [Match.objectLike({ SubnetId: 'subnet-0def5678', AssociatePublicIpAddress: true })],
+  });
+  template.hasResourceProperties('AWS::EC2::SecurityGroup', { VpcId: 'vpc-0abc1234' });
+});
+
+test('a private existing subnet gets no public IP', () => {
+  synth(existingNetwork('private')).hasResourceProperties('AWS::EC2::Instance', {
+    SubnetId: 'subnet-0def5678',
+    NetworkInterfaces: Match.absent(),
   });
 });

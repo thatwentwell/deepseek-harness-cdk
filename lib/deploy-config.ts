@@ -1,5 +1,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import type { NetworkConfig } from './network';
+
+export type { NetworkConfig };
 
 /** Where the agent's model runs. */
 export type LlmProvider = 'bedrock' | 'deepseek-api';
@@ -24,12 +27,11 @@ export interface DeployConfig {
   stackName: string;
   instanceType: string;
   volumeSizeGiB: number;
-  privateSubnet: boolean;
+  network: NetworkConfig;
   dshVersion: string;
   nodeMajor: number;
   webPort: number;
   blockImdsForAgent: boolean;
-  vpcId?: string;
   existingSecretArn?: string;
 }
 
@@ -44,7 +46,7 @@ export const DEFAULTS: Omit<DeployConfig, 'region'> = {
   stackName: 'DeepseekHarness',
   instanceType: 't4g.large',
   volumeSizeGiB: 50,
-  privateSubnet: false,
+  network: { mode: 'new', privateSubnet: false },
   dshVersion: '0.2.0-rc.2',
   nodeMajor: 22,
   webPort: 3080,
@@ -60,16 +62,15 @@ export const FIELD_HELP: Record<keyof DeployConfig, string> = {
   stackName: 'Nombre del stack de CloudFormation',
   instanceType: 'Tipo de instancia EC2 (ARM o x86; la AMI se elige sola)',
   volumeSizeGiB: 'Tamaño del disco raíz en GiB',
-  privateSubnet: 'true: subred privada + NAT Gateway (costo extra)',
+  network: 'VPC nueva (pública o privada con NAT) o VPC y subred existentes',
   dshVersion: 'Versión de @deepseek-ai/dsh',
   nodeMajor: 'Versión mayor de Node.js',
   webPort: 'Puerto de la Web UI (en loopback y en el túnel local)',
   blockImdsForAgent: 'Bloquea al agente el acceso a las credenciales de la instancia',
-  vpcId: '(opcional) VPC existente en lugar de crear una',
   existingSecretArn: '(opcional) Secreto existente con la DEEPSEEK_API_KEY (solo con deepseek-api)',
 };
 
-const REQUIRED_TYPES: Record<keyof DeployConfig, 'string' | 'number' | 'boolean'> = {
+const REQUIRED_TYPES: Record<keyof DeployConfig, 'string' | 'number' | 'boolean' | 'object'> = {
   region: 'string',
   llmProvider: 'string',
   bedrockModel: 'string',
@@ -77,15 +78,50 @@ const REQUIRED_TYPES: Record<keyof DeployConfig, 'string' | 'number' | 'boolean'
   stackName: 'string',
   instanceType: 'string',
   volumeSizeGiB: 'number',
-  privateSubnet: 'boolean',
+  network: 'object',
   dshVersion: 'string',
   nodeMajor: 'number',
   webPort: 'number',
   blockImdsForAgent: 'boolean',
-  vpcId: 'string',
   existingSecretArn: 'string',
 };
-const OPTIONAL_FIELDS = new Set<keyof DeployConfig>(['vpcId', 'existingSecretArn']);
+const OPTIONAL_FIELDS = new Set<keyof DeployConfig>(['existingSecretArn']);
+
+/** Problems with the `network` object, empty when it is valid. */
+function networkErrors(raw: unknown): string[] {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return [];
+  const net = raw as Record<string, unknown>;
+  const expected: Record<string, Record<string, string>> = {
+    new: { mode: 'string', privateSubnet: 'boolean' },
+    existing: { mode: 'string', vpcId: 'string', subnetId: 'string', availabilityZone: 'string', subnetType: 'string' },
+  };
+  const fields = expected[net.mode as string];
+  if (!fields) return ['"network.mode" debe ser new o existing'];
+  const errors: string[] = [];
+  for (const [key, type] of Object.entries(fields)) {
+    if (net[key] === undefined || net[key] === '') errors.push(`falta "network.${key}"`);
+    else if (typeof net[key] !== type) errors.push(`"network.${key}" debe ser ${type}`);
+  }
+  for (const key of Object.keys(net)) {
+    if (!(key in fields)) errors.push(`campo desconocido "network.${key}" (con mode ${net.mode})`);
+  }
+  if (net.mode === 'existing') {
+    if (typeof net.vpcId === 'string' && net.vpcId && !/^vpc-[0-9a-f]+$/.test(net.vpcId)) errors.push('"network.vpcId" no parece un ID de VPC');
+    if (typeof net.subnetId === 'string' && net.subnetId && !/^subnet-[0-9a-f]+$/.test(net.subnetId)) {
+      errors.push('"network.subnetId" no parece un ID de subred');
+    }
+    if (typeof net.subnetType === 'string' && net.subnetType && !['public', 'private'].includes(net.subnetType)) {
+      errors.push('"network.subnetType" debe ser public o private');
+    }
+  }
+  return errors;
+}
+
+/** One-line summary of the network settings. */
+export function describeNetwork(net: NetworkConfig): string {
+  if (net.mode === 'new') return `VPC nueva, subred ${net.privateSubnet ? 'privada con NAT' : 'pública'}`;
+  return `${net.vpcId} / ${net.subnetId} (${net.availabilityZone}, ${net.subnetType === 'public' ? 'pública' : 'privada'})`;
+}
 
 /** Validates parsed JSON, listing every problem at once. */
 export function parseDeployConfig(raw: unknown, source = CONFIG_FILE): DeployConfig {
@@ -98,13 +134,14 @@ export function parseDeployConfig(raw: unknown, source = CONFIG_FILE): DeployCon
     const value = obj[key];
     if (value === undefined || value === null || value === '') {
       if (!OPTIONAL_FIELDS.has(key)) errors.push(`falta "${key}"`);
-    } else if (typeof value !== type) {
+    } else if (typeof value !== type || (type === 'object' && (value === null || Array.isArray(value)))) {
       errors.push(`"${key}" debe ser ${type}`);
     }
   }
   for (const key of Object.keys(obj)) {
     if (!(key in REQUIRED_TYPES)) errors.push(`campo desconocido "${key}"`);
   }
+  errors.push(...networkErrors(obj.network));
   if (typeof obj.llmProvider === 'string' && !LLM_PROVIDERS.includes(obj.llmProvider as LlmProvider)) {
     errors.push(`"llmProvider" debe ser ${LLM_PROVIDERS.join(' o ')}`);
   }
@@ -115,7 +152,6 @@ export function parseDeployConfig(raw: unknown, source = CONFIG_FILE): DeployCon
     throw new Error(`${source} no es válido:\n  - ${errors.join('\n  - ')}`);
   }
   const config = obj as unknown as DeployConfig;
-  if (!config.vpcId) delete config.vpcId;
   if (!config.existingSecretArn) delete config.existingSecretArn;
   return config;
 }
@@ -140,8 +176,9 @@ export function saveDeployConfig(config: DeployConfig, file = CONFIG_FILE): void
 export function formatConfigRows(config: DeployConfig): string[] {
   const keys = Object.keys(FIELD_HELP) as (keyof DeployConfig)[];
   const width = Math.max(...keys.map((k) => k.length));
-  const valueWidth = Math.max(...keys.map((k) => String(config[k] ?? '—').length));
-  return keys.map((k) => `  ${k.padEnd(width)}  ${String(config[k] ?? '—').padEnd(valueWidth)}  ${FIELD_HELP[k]}`);
+  const show = (k: keyof DeployConfig) => (k === 'network' ? describeNetwork(config.network) : String(config[k] ?? '—'));
+  const valueWidth = Math.max(...keys.map((k) => show(k).length));
+  return keys.map((k) => `  ${k.padEnd(width)}  ${show(k).padEnd(valueWidth)}  ${FIELD_HELP[k]}`);
 }
 
 /** Human-readable table of the configuration and where to edit it. */

@@ -9,3 +9,6 @@ cdk.out
 
 # Local deploy settings (created by npm run deploy)
 deploy.config.json
+
+# CDK lookup cache: holds account IDs and AZs of whoever deployed
+cdk.context.json

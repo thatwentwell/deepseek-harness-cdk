@@ -6,11 +6,13 @@
   "stackName": "DeepseekHarness",
   "instanceType": "t4g.large",
   "volumeSizeGiB": 50,
-  "privateSubnet": false,
+  "network": {
+    "mode": "new",
+    "privateSubnet": false
+  },
   "dshVersion": "0.2.0-rc.2",
   "nodeMajor": 22,
   "webPort": 3080,
   "blockImdsForAgent": true,
-  "vpcId": "",
   "existingSecretArn": ""
 }
